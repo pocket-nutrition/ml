@@ -5,22 +5,18 @@ import logging
 import numpy as np
 from fastapi import APIRouter
 
-from app.lookup import is_known_ingredient, resolve_cooking_method
+from app.lookup import resolve_cooking_method
 from app.model import get_model
-from app.schemas import IngredientResult, MealInput, NutritionalResult, PredictionResponse
+from app.schemas import IngredientInput, IngredientResult, MealInput, NutritionalResult, PredictionResponse
 
 router = APIRouter()
 log = logging.getLogger(__name__)
 
-_DEFAULT_FEATURE_COLUMNS = [
-    "energy_kcal", "water_g", "protein_g", "fat_g", "carbohydrates_g", "fiber_g", "sodium_mg",
-]
-_PLANT_GROUPS = frozenset({"vegetable", "cereal"})
 _DAIRY_GROUPS = frozenset({"dairy"})
 _SODIUM_CLAMP_RATIO = 1.5
 _SODIUM_ABS_CAP_PER_100G = 250.0
 
-# Per-cooking-method fat concentration cap (multiplier on raw fat, per 100g raw basis).
+# Per-cooking-method upper bound on predicted fat (multiplier on raw fat, per 100 g raw basis).
 # Grilling/roasting render fat out rather than concentrating it; fried absorbs oil.
 # Applies only when raw_fat < 5.0g (lean ingredients).
 _FAT_CAP_BY_METHOD: dict[str, float] = {
@@ -32,10 +28,6 @@ _FAT_CAP_BY_METHOD: dict[str, float] = {
     "cooked":  2.5,
 }
 
-_MEAT_GROUPS = frozenset({"meat", "fish", "shellfish"})
-# Methods where fat concentrates from water loss; model tends to under-predict for lean meats.
-_FAT_FLOOR_METHODS = frozenset({"grilled", "roasted"})
-
 
 def _atwater_energy(nutrients: dict) -> float:
     p = nutrients.get("protein_g") or 0.0
@@ -46,6 +38,38 @@ def _atwater_energy(nutrients: dict) -> float:
     return p * 4.0 + f * 9.0 + available_carbs * 4.0 + fiber * 2.0
 
 
+_NO_YIELD_CONFIDENCE = 0.8
+
+
+def _cooked_yield(ingredient_id: str, food_group: str, method: str, artifact: dict) -> float | None:
+    """Cooked/raw mass ratio used to turn a cooked weight into its raw equivalent.
+
+    Order: the ingredient's yield for this method, its generic "cooked" yield (Ciqual names
+    like "Riz blanc, cuit" are stored under "cooked"), then the median known yield of its
+    food group for this method (computed by ingest). None when nothing applies.
+    """
+    own = (artifact.get("yield_factors") or {}).get(ingredient_id, {})
+    group = (artifact.get("group_yield_factors") or {}).get(food_group, {})
+    for candidate in (own.get(method), own.get("cooked"), group.get(method)):
+        if candidate and candidate > 0:
+            return float(candidate)
+    return None
+
+
+def _known_nutrients(ing: IngredientInput) -> dict | None:
+    """Raw nutrients supplied by the caller, or None when there is nothing to transform.
+
+    A profile whose nutrient fields are all null carries no information: predicting from it
+    would mean predicting from an all-zero feature vector, i.e. inventing values.
+    """
+    if ing.raw_profile is None:
+        return None
+    nutrients = ing.raw_profile.as_nutrient_dict()
+    if all(v is None for v in nutrients.values()):
+        return None
+    return nutrients
+
+
 def _build_feature_vector(
     raw: dict | None,
     feature_cols: list[str],
@@ -53,7 +77,12 @@ def _build_feature_vector(
     food_group: str,
     artifact: dict,
 ) -> np.ndarray:
-    raw_vals = [(raw.get(c) or 0.0) if raw else 0.0 for c in feature_cols]
+    # A nutrient the source did not measure is missing (NaN), not zero: the artifact's scaler
+    # imputes it the same way training did, and XGBoost routes any remaining NaN natively.
+    raw_vals = [
+        float(raw[c]) if raw and raw.get(c) is not None else np.nan
+        for c in feature_cols
+    ]
     raw_scaled = artifact["scaler"].transform(np.array([raw_vals], dtype=float))
 
     cooking_encoder = artifact.get("cooking_encoder")
@@ -85,21 +114,17 @@ def _predict_raw(meal: MealInput, artifact: dict | None) -> PredictionResponse:
         )
 
     raw_index: dict = artifact.get("raw_index") or artifact.get("food_index", {})
-    target_cols: list[str] = artifact.get("target_columns", list(_DEFAULT_FEATURE_COLUMNS))
+    target_cols: list[str] = artifact["target_columns"]
 
     ingredient_results: list[IngredientResult] = []
     total_nutrients: dict[str, float] = {}
     ingredient_confs: list[float] = []
 
     for ing in meal.ingredients:
-        if ing.raw_profile is not None:
-            profile = ing.raw_profile.as_nutrient_dict()
-            unknown = False
-        else:
-            profile = raw_index.get(ing.ingredient_id)
-            unknown = profile is None
-            if unknown:
-                log.debug("ingredient_id '%s' not in raw_index (unknown=True)", ing.ingredient_id)
+        profile = _known_nutrients(ing) or raw_index.get(ing.ingredient_id)
+        unknown = profile is None
+        if unknown:
+            log.debug("ingredient_id '%s': no usable raw_profile (unknown=True)", ing.ingredient_id)
         ingredient_results.append(IngredientResult(
             ingredient_id=ing.ingredient_id,
             weight_g=ing.weight_g,
@@ -112,6 +137,14 @@ def _predict_raw(meal: MealInput, artifact: dict | None) -> PredictionResponse:
                 if val is not None:
                     total_nutrients[col] = total_nutrients.get(col, 0.0) + max(0.0, float(val)) * scale
         ingredient_confs.append(0.7 if unknown else 1.0)
+
+    if all(r.unknown for r in ingredient_results):
+        return PredictionResponse(
+            cooking_type=meal.cooking_type,
+            cooking_duration_min=meal.cooking_duration_min,
+            ingredients=ingredient_results,
+            result=None,
+        )
 
     confidence = round(sum(ingredient_confs) / len(ingredient_confs), 4) if ingredient_confs else 0.0
     nutrient_fields = {col: total_nutrients.get(col) for col in target_cols}
@@ -146,9 +179,7 @@ def predict(meal: MealInput) -> PredictionResponse:
     method_conf = 1.0 if method_known else 0.8
 
     food_index = artifact.get("food_index", {}) if artifact else {}
-    feature_cols = artifact.get("feature_columns", _DEFAULT_FEATURE_COLUMNS) if artifact else _DEFAULT_FEATURE_COLUMNS
-    plant_ids = set(artifact.get("plant_ingredient_ids", [])) if artifact else set()
-    yield_factors: dict = artifact.get("yield_factors", {}) if artifact else {}
+    feature_cols = artifact["feature_columns"] if artifact else []
 
     ingredient_results: list[IngredientResult] = []
     total_nutrients: dict[str, float] = {}
@@ -156,18 +187,8 @@ def predict(meal: MealInput) -> PredictionResponse:
     ingredient_confs: list[float] = []
 
     for ing in meal.ingredients:
-        if ing.raw_profile is not None:
-            raw: dict | None = ing.raw_profile.as_nutrient_dict()
-            food_group = ing.raw_profile.food_group
-            is_plant = ing.raw_profile.is_plant
-            unknown = False
-        else:
-            raw = None
-            unknown = True
-            food_group = "other"
-            is_plant = False
-            log.debug("ingredient_id '%s': no raw_profile supplied by API (unknown=True)", ing.ingredient_id)
-
+        raw = _known_nutrients(ing)
+        unknown = raw is None
         ingredient_results.append(IngredientResult(
             ingredient_id=ing.ingredient_id,
             weight_g=ing.weight_g,
@@ -176,19 +197,23 @@ def predict(meal: MealInput) -> PredictionResponse:
 
         if artifact is None:
             continue
+        if unknown:
+            # Nothing to transform: contribute no nutrients, only lower the meal confidence.
+            log.debug("ingredient_id '%s': no usable raw_profile (unknown=True)", ing.ingredient_id)
+            ingredient_confs.append(0.7)
+            continue
+
+        food_group = ing.raw_profile.food_group
+        is_plant = ing.raw_profile.is_plant
 
         target_cols = artifact["target_columns"]
-        cooked_norm = artifact.get("cooked_normalized_profiles") or {}
-        exact_norm = (cooked_norm.get(ing.ingredient_id) or {}).get(canonical_method)
-        if exact_norm is not None:
-            y_pred = np.array([exact_norm.get(col, 0.0) for col in target_cols], dtype=float)
-        else:
-            X = _build_feature_vector(raw, feature_cols, canonical_method, food_group, artifact)
-            y_pred = artifact["model"].predict(X)[0]
+        X = _build_feature_vector(raw, feature_cols, canonical_method, food_group, artifact)
+        y_pred = artifact["model"].predict(X)[0]
 
         # Clamp predicted fat and protein to biological maximums.
         # For plants: cooking conserves protein/fat per gram of raw input — cap at raw × 1.1.
-        # For meats/fish: fat can concentrate up to 2.5× from water loss; protein up to 2.5×.
+        # For other foods: fat is capped per cooking method (frying absorbs oil).
+        # All values are per 100 g of RAW input, so water loss does not concentrate them here.
         raw_fat = (raw.get("fat_g") or 0.0) if raw else 0.0
         raw_protein = (raw.get("protein_g") or 0.0) if raw else 0.0
         fat_pred_idx = target_cols.index("fat_g") if "fat_g" in target_cols else -1
@@ -203,12 +228,7 @@ def predict(meal: MealInput) -> PredictionResponse:
         else:
             if fat_pred_idx >= 0 and raw_fat < 5.0:
                 fat_cap_mult = _FAT_CAP_BY_METHOD.get(canonical_method, 2.5)
-                fat_val = min(float(y_pred[fat_pred_idx]), raw_fat * fat_cap_mult)
-                # Biological minimum: grilling/roasting concentrates fat via water loss.
-                # Model under-predicts for lean meats due to synthetic training noise.
-                if canonical_method in _FAT_FLOOR_METHODS and food_group in _MEAT_GROUPS:
-                    fat_val = max(fat_val, raw_fat * 1.8)
-                y_pred[fat_pred_idx] = fat_val
+                y_pred[fat_pred_idx] = min(float(y_pred[fat_pred_idx]), raw_fat * fat_cap_mult)
             # If raw carbs are trace (< 1g/100g), cooking cannot generate carbohydrates —
             # zero the prediction for all non-plant, non-dairy ingredients regardless of food_group.
             # (Handles meat/fish that land in "other" due to missing training pairs.)
@@ -222,13 +242,17 @@ def predict(meal: MealInput) -> PredictionResponse:
 
         # When the caller measured the cooked weight, convert to equivalent raw input
         # weight so the scale factor matches the model's training basis (per 100g raw).
+        ing_conf = 1.0
         if ing.measured_state == "cooked":
-            ing_yield = yield_factors.get(ing.ingredient_id, {}).get(canonical_method)
-            # Fallback: if no yield_f for this specific method, try generic "cooked"
-            # (e.g. Ciqual names "Riz blanc, cuit" → yields stored under "cooked", not "boiled")
+            ing_yield = _cooked_yield(ing.ingredient_id, food_group, canonical_method, artifact)
             if ing_yield is None:
-                ing_yield = yield_factors.get(ing.ingredient_id, {}).get("cooked")
-            raw_weight_g = ing.weight_g / ing_yield if (ing_yield and ing_yield > 0) else ing.weight_g
+                # No yield at all: the cooked weight is used as raw weight, which can be far
+                # off (meat loses ~25 %, rice gains ~150 %). Say so through the confidence.
+                log.debug("no yield for '%s' %s: cooked weight used as raw", ing.ingredient_id, canonical_method)
+                ing_conf = _NO_YIELD_CONFIDENCE
+                raw_weight_g = ing.weight_g
+            else:
+                raw_weight_g = ing.weight_g / ing_yield
         else:
             raw_weight_g = ing.weight_g
 
@@ -268,9 +292,9 @@ def predict(meal: MealInput) -> PredictionResponse:
             factor = absorption.get(col, 1.0)
             total_absorbed[col] = total_absorbed.get(col, 0.0) + val * factor
 
-        ingredient_confs.append(0.7 if unknown else 1.0)
+        ingredient_confs.append(ing_conf)
 
-    if artifact is None or not ingredient_confs:
+    if artifact is None or all(r.unknown for r in ingredient_results):
         return PredictionResponse(
             cooking_type=meal.cooking_type,
             cooking_duration_min=meal.cooking_duration_min,

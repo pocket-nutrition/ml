@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class RawProfile(BaseModel):
-    """Raw nutritional profile per 100g supplied by the API from ingredient_profiles (Elasticsearch)."""
+    """Raw nutritional profile per 100g supplied by the API from the product_search index (Elasticsearch)."""
 
     energy_kcal: Optional[float] = None
     water_g: Optional[float] = None

@@ -14,7 +14,8 @@ when...").
 ## Describe the solution you'd like
 
 A clear and concise description of what you want to happen. If it changes the `/predict`
-request or response contract, include an example payload.
+request or response contract (`MealInput`, `PredictionResponse`, `RawProfile`, etc. in
+`app/schemas.py`), include an example payload.
 
 ## Describe alternatives you've considered
 

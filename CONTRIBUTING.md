@@ -8,7 +8,13 @@ microservice, so the contribution process is intentionally lightweight.
 ```bash
 git clone https://github.com/pocket-nutrition/ml.git
 cd ml
+./setup.sh                       # creates .venv, installs deps, copies .env.example → .env
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+```
 
+Or set up manually:
+
+```bash
 python3.12 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
@@ -42,7 +48,8 @@ import annotations` where already used, English identifiers and comments).
 ## Test-first expectations
 
 This is a prediction/transform service with subtle numeric behaviour (clamping, yield
-factors, confidence scoring). For any change to `app/router.py` or `app/lookup.py`:
+factors, confidence scoring, cooked-profile lookups). For any change to `app/router.py` or
+`app/lookup.py`:
 
 1. Add or update a test in `tests/test_predict.py` or `tests/test_lookup.py` that captures
    the behavior you're adding or fixing.
@@ -69,7 +76,18 @@ the training pipeline that produces the model artifact this service loads, not i
 
 ## Reporting issues
 
-Please use the GitHub issue templates (bug report / feature request) under
-`.github/ISSUE_TEMPLATE/`. Include the request payload and response you got from `/predict`
-when reporting incorrect predictions — this service has no database, so reproducing an issue
-requires the exact `raw_profile` and `cooking_type` used.
+Please open a GitHub issue describing the problem. Include the request payload and response
+you got from `/predict` when reporting incorrect predictions — this service has no database,
+so reproducing an issue requires the exact `raw_profile` and `cooking_type` used.
+
+## CI and releases
+
+- Every pull request runs `.github/workflows/ci.yml`. The `ci-success` check must be green before a pull
+  request can be merged, the branch must be up to date with `main`, and pull requests are squash-merged
+  so history stays linear.
+- If you contribute from a fork, the workflow waits for a maintainer to approve it. It runs with a
+  read-only token and no secrets.
+- Every commit merged to `main` is released automatically with a CalVer version, `vYYYY.M.N`: the year, the
+  month, then a counter that restarts at 1 each month (for example `v2026.11.1`). You never pick a version
+  number or edit a changelog; release notes are generated from the merged pull requests.
+- A release publishes the container image `ghcr.io/pocket-nutrition/ml`.

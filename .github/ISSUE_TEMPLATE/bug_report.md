@@ -23,7 +23,7 @@ The exact JSON body you sent to `/predict` (or `/health`):
 
 ## Actual response
 
-The exact JSON response you received.
+The exact JSON response you received (include `result` and, if relevant, `absorbed_result`).
 
 ```json
 ```

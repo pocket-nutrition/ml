@@ -172,17 +172,47 @@ def test_predict_unknown_cooking_method_reduces_confidence():
     assert known["result"]["confidence"] > unknown["result"]["confidence"]
 
 
-def test_predict_unknown_ingredient_flagged_and_lower_confidence():
-    # An ingredient without raw_profile should be marked unknown with reduced confidence.
+_EMPTY_PROFILE = {"food_group": "other"}  # resolved, but no nutrient value at all
+
+
+@pytest.mark.parametrize("cooking_type", ["grilled", "raw"])
+def test_predict_unknown_ingredient_returns_no_result(cooking_type):
+    # Without a raw profile there is nothing to transform: the service must not
+    # invent values from an all-zero feature vector.
     artifact = _make_artifact()
-    no_profile_meal = {
-        "cooking_type": "grilled",
-        "ingredients": [{"ingredient_id": "poulet_filet", "weight_g": 150}],
+    meal = {
+        "cooking_type": cooking_type,
+        "ingredients": [{"ingredient_id": "zzqx", "weight_g": 100}],
     }
     with patch("app.router.get_model", return_value=artifact):
-        response = client.post("/predict", json=no_profile_meal).json()
+        response = client.post("/predict", json=meal).json()
     assert response["ingredients"][0]["unknown"] is True
-    assert response["result"]["confidence"] < 1.0
+    assert response["result"] is None
+
+
+@pytest.mark.parametrize("cooking_type", ["grilled", "raw"])
+def test_predict_profile_without_any_nutrient_is_unknown(cooking_type):
+    artifact = _make_artifact()
+    meal = _meal(cooking_type=cooking_type, ingredients=[_with_profile("zzqx", 100, _EMPTY_PROFILE)])
+    with patch("app.router.get_model", return_value=artifact):
+        response = client.post("/predict", json=meal).json()
+    assert response["ingredients"][0]["unknown"] is True
+    assert response["result"] is None
+
+
+def test_predict_unknown_ingredient_contributes_nothing_to_meal_total():
+    artifact = _make_artifact()
+    known_only = _meal(ingredients=[_with_profile("poulet_filet", 150, CHICKEN_PROFILE)])
+    mixed = _meal(ingredients=[
+        _with_profile("poulet_filet", 150, CHICKEN_PROFILE),
+        {"ingredient_id": "zzqx", "weight_g": 100},
+    ])
+    with patch("app.router.get_model", return_value=artifact):
+        alone = client.post("/predict", json=known_only).json()
+        both = client.post("/predict", json=mixed).json()
+    assert [i["unknown"] for i in both["ingredients"]] == [False, True]
+    assert both["result"]["energy_kcal"] == pytest.approx(alone["result"]["energy_kcal"])
+    assert both["result"]["confidence"] < alone["result"]["confidence"]
 
 
 def test_predict_unknown_ingredient_still_predicts():
@@ -248,3 +278,90 @@ def test_predict_sodium_clamped():
         )).json()
     # sodium_mg ≤ raw_sodium_mg × 1.5 × (100/100) = 150 mg
     assert response["result"]["sodium_mg"] <= 150.0
+
+
+class _FixedModel:
+    """Stand-in regressor returning one fixed per-100 g-raw prediction."""
+
+    def __init__(self, values: dict):
+        self._row = [values.get(col, 0.0) for col in TARGET_COLS]
+
+    def predict(self, X):
+        return np.array([self._row] * len(X), dtype=float)
+
+
+def test_lean_meat_grilled_fat_is_not_raised_above_the_model_prediction():
+    # Targets are per 100 g of raw input: grilling renders fat out, it cannot add fat per raw
+    # gram. The former floor (raw fat x 1.8) assumed per-cooked values and inflated fat.
+    artifact = {**_make_artifact(), "model": _FixedModel({"energy_kcal": 110.0, "protein_g": 23.0, "fat_g": 1.2})}
+    meal = _meal(cooking_type="grilled", ingredients=[_with_profile("poulet_filet", 100, CHICKEN_PROFILE)])
+    with patch("app.router.get_model", return_value=artifact):
+        result = client.post("/predict", json=meal).json()["result"]
+    assert result["fat_g"] == pytest.approx(1.2)
+
+
+class _RecordingModel(_FixedModel):
+    """Fixed prediction that also keeps the feature matrix it was called with."""
+
+    def predict(self, X):
+        self.last_X = np.array(X, dtype=float)
+        return super().predict(X)
+
+
+def test_missing_raw_nutrient_reaches_the_model_as_missing_not_zero():
+    # Training imputes a missing raw nutrient (median) or lets XGBoost route NaN; feeding 0.0
+    # instead tells the model the food has none of it.
+    model = _RecordingModel({"energy_kcal": 110.0})
+    artifact = {**_make_artifact(), "model": model}
+    profile = {k: v for k, v in CHICKEN_PROFILE.items() if k != "sodium_mg"}
+    meal = _meal(cooking_type="grilled", ingredients=[_with_profile("poulet_filet", 100, profile)])
+    with patch("app.router.get_model", return_value=artifact):
+        assert client.post("/predict", json=meal).status_code == 200
+    sodium_idx = FEATURE_COLS.index("sodium_mg")
+    assert np.isnan(model.last_X[0, sodium_idx])
+    assert not np.isnan(model.last_X[0, FEATURE_COLS.index("protein_g")])
+
+
+def _cooked_chicken_meal() -> dict:
+    # 100 g weighed AFTER grilling; the model works per 100 g of raw input.
+    return _meal(cooking_type="grilled", ingredients=[
+        _with_profile("poulet_filet", 100, CHICKEN_PROFILE, measured_state="cooked"),
+    ])
+
+
+def _yield_artifact(yield_factors=None, group_yield_factors=None) -> dict:
+    artifact = {**_make_artifact(), "model": _FixedModel({"energy_kcal": 100.0})}
+    if yield_factors is not None:
+        artifact["yield_factors"] = yield_factors
+    if group_yield_factors is not None:
+        artifact["group_yield_factors"] = group_yield_factors
+    return artifact
+
+
+def test_cooked_weight_uses_the_food_group_yield_when_the_ingredient_has_none():
+    artifact = _yield_artifact(group_yield_factors={"meat": {"grilled": 0.5}})
+    with patch("app.router.get_model", return_value=artifact):
+        result = client.post("/predict", json=_cooked_chicken_meal()).json()["result"]
+    # 100 g cooked / 0.5 = 200 g raw → 2 × the per-100 g-raw prediction.
+    assert result["energy_kcal"] == pytest.approx(200.0)
+
+
+def test_ingredient_yield_takes_precedence_over_the_food_group_yield():
+    artifact = _yield_artifact(
+        yield_factors={"poulet_filet": {"grilled": 0.8}},
+        group_yield_factors={"meat": {"grilled": 0.5}},
+    )
+    with patch("app.router.get_model", return_value=artifact):
+        result = client.post("/predict", json=_cooked_chicken_meal()).json()["result"]
+    assert result["energy_kcal"] == pytest.approx(125.0)
+
+
+def test_cooked_weight_without_any_yield_lowers_confidence_instead_of_failing():
+    with patch("app.router.get_model", return_value=_yield_artifact(yield_factors={"poulet_filet": {"grilled": 0.8}})):
+        with_yield = client.post("/predict", json=_cooked_chicken_meal()).json()["result"]
+    with patch("app.router.get_model", return_value=_yield_artifact()):
+        response = client.post("/predict", json=_cooked_chicken_meal())
+    assert response.status_code == 200
+    without = response.json()["result"]
+    assert without["energy_kcal"] == pytest.approx(100.0)  # weight taken as raw, as before
+    assert without["confidence"] < with_yield["confidence"]

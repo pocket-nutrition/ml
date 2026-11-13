@@ -13,11 +13,20 @@ ingredient's raw nutritional profile in the request body. It is part of the larg
 - Python 3.12 (matches the `python:3.12-slim` base image in the [Dockerfile](Dockerfile))
 - `pip`
 
-## Running locally
+## Quick start
+
+```bash
+./setup.sh                                # creates .venv, installs deps, copies .env.example
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8000
+```
+
+Or set up manually:
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -90,11 +99,13 @@ Request body (`MealInput`):
   - `measured_state` (`"raw"` or `"cooked"`, default `"raw"`) — whether `weight_g` was
     measured before or after cooking. When `"cooked"`, the service converts back to an
     equivalent raw weight using a yield factor from the model artifact before scaling.
-  - `raw_profile` (object, optional) — the ingredient's raw nutritional profile per 100 g,
-    plus `food_group` (string, default `"other"`) and `is_plant` (bool, default `false`).
-    If omitted, the ingredient is marked `unknown: true` in the response and is excluded
-    from the nutrient totals (with a confidence penalty), rather than falling back to any
-    internal lookup — this service holds no ingredient database of its own.
+  - `raw_profile` (object, optional) — the ingredient's raw nutritional profile per 100 g
+    (energy, macronutrients, and a range of vitamins/minerals — see `app/schemas.py` for
+    the full field list), plus `food_group` (string, default `"other"`) and `is_plant`
+    (bool, default `false`). If omitted, the ingredient is marked `unknown: true` in the
+    response and is excluded from the nutrient totals (with a confidence penalty), rather
+    than falling back to any internal lookup — this service holds no ingredient database
+    of its own.
 
 Response body (`PredictionResponse`):
 
@@ -112,7 +123,6 @@ Response body (`PredictionResponse`):
     "carbohydrates_g": 0.0,
     "fiber_g": null,
     "water_g": 55.0,
-    "sugars_g": null,
     "sodium_mg": 94.5,
     "confidence": 0.87
   },
@@ -127,9 +137,24 @@ Response body (`PredictionResponse`):
   absorption factors (e.g. bioavailability), when the model artifact provides them for
   at least one ingredient; otherwise `null`.
 
+Compared to v1, this service additionally applies biological plausibility clamps (fat/protein
+concentration caps by cooking method, carbohydrate conservation, sodium clamping, an Atwater
+energy sanity check) and supports a `cooked_normalized_profiles` lookup in the model artifact
+for ingredient/method pairs with a precomputed cooked profile, bypassing model inference for
+those cases.
+
 See `app/schemas.py` for the full list of nutrient fields supported on `raw_profile` and
-`result` (energy, macronutrients, and a range of vitamins/minerals), and `CLAUDE.md` for
-architecture notes and conventions.
+`result`, and `CLAUDE.md` for architecture notes and conventions.
+
+## Using with Claude Code
+
+This project includes a [CLAUDE.md](CLAUDE.md) that gives Claude Code full context on the
+service's architecture, API contract, and conventions (including the "no hardcoded
+nutritional data" rule).
+
+```bash
+claude    # Start Claude Code — reads CLAUDE.md automatically
+```
 
 ## Contributing
 
